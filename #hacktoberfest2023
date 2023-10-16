@@ -1,0 +1,1140 @@
+from ats import tcl
+from ats import aetest
+from ats.log.utils import banner
+
+from unicon.eal.dialogs import Dialog
+from unicon.eal.dialogs import Statement
+
+import time
+import logging
+import os
+import sys
+import re
+import pdb
+import json
+import pprint
+import socket
+import struct
+import inspect
+import yaml
+import random
+import ipaddress
+
+from yaml import loader
+from pyats.aetest.steps import Steps
+
+log = logging.getLogger(__name__)
+log.setLevel(logging.DEBUG)
+
+global uut1           
+global port
+class ForkedPdb(pdb.Pdb):
+    '''A Pdb subclass that may be used
+    from a forked multiprocessing child1
+    '''
+    def interaction(self, *args, **kwargs):
+        _stdin = sys.stdin
+        try:
+            sys.stdin = open('/dev/stdin')
+            pdb.Pdb.interaction(self, *args, **kwargs)
+        finally:
+            sys.stdin = _stdin
+
+################################################################################ 
+####                       COMMON SETUP SECTION                             ####
+################################################################################
+
+class common_setup(aetest.CommonSetup):
+    @aetest.subsection
+    def connecting_to_device_and_write_erase(self,testscript,testbed,R1):
+        global file
+        global uut1
+        uut1=testbed.devices[R1]
+        log.info("Connecting to Device...")
+        log.info("%s"%uut1.name)
+        try:
+            uut1.connect()
+            log.info(banner("Connected to device successfully, Run-Time is approx. 12 minutes, Starting write-erase now"))
+            ran = (random.randint(0,100))
+            file = (f"UDM_{ran}.cfg")
+            testscript.parameters['file'] = file
+            uut1.configure(f"copy running-config {file}",timeout = 600)    
+            uut1.transmit("write erase\r",timeout = 300)
+            uut1.receive("Do you wish to proceed anyway?",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("Abort Power On Auto Provisioning",timeout = 300)
+            uut1.transmit("yes\r",timeout = 300)
+            uut1.receive("Do you want to enforce secure password standard",timeout = 300)
+            uut1.transmit("no\r",timeout = 300)
+            uut1.receive("Enter the password for",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive("Confirm the password for",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive("Would you like to enter the basic configuration dialog",timeout = 300)
+            uut1.transmit("no\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive("switch#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)
+            uut1.configure(f"hostname {uut1.name}")
+        except Exception as e:
+            log.info("Connection to %s Unsuccessful "\
+                      "Exiting error:%s"%(uut1.name,e))
+            self.failed(goto=['exit'])
+class dual_stage_commit_and_checking_running_configs(aetest.Testcase):
+    @aetest.test
+    def L3_interface(self,testbed,testscript):
+        num = 0
+        yum = 0
+        count = 0
+        match = []
+        out=uut1.configure(f"default interface ethernet {testbed.custom['1interface']}",timeout=300)
+        while "Interface config wipeout failed." in out:
+            out=uut1.configure(f"default interface ethernet {testbed.custom['1interface']}",timeout=300)
+        log.info(banner("Configuring in Dual-Stage Commit"))
+        try:
+            output=uut1.configure(f"configure dual-stage\ninterface ethernet {testbed.custom['1interface']}\nno switchport\nno shutdown\nip address {testbed.custom['1ipv4']}/24\nipv6 address {testbed.custom['1ipv6']}/64\nmac-address {testbed.custom['1mac']}\nno shutdown\ncommit\nshow running-config interface ethernet {testbed.custom['1interface']}\nexit",timeout = 600)
+            find = re.search(r'version.*?exit', output, re.DOTALL)
+            section = find.group(0)
+            lines = output.split('\n')
+            lines = [line.strip() for line in lines]
+            z=lines
+            pattern=f"Verification Succeeded."
+            for j in z:
+                if pattern == j and 'Commit ID' in output:
+                    count = count + 1
+            if count == 1:
+                log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+            else:
+                self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+        except:
+            log.warning("Some issue encountered during dual-stage commit.")
+            self.failed(goto=['exit'])
+        m = section.split('\n')
+        m = [n.strip() for n in m]    
+        log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+        x=uut1.execute(f"show running-config interface ethernet {testbed.custom['1interface']}")
+        line = x.split('\n')
+        line = [l.strip() for l in line]
+        y=line
+        for i in y:
+            if i in m:
+                match.append(i)        
+        ip=ipaddress.IPv6Network(f"{testbed.custom['1ipv6']}", strict=False)
+        ipv6=str(ip)
+        address,subnet = ipv6.split('/')
+        ip=f"{address}/64"
+        if f"interface Ethernet{testbed.custom['1interface']}" in match:
+            if f"ip address {testbed.custom['1ipv4']}/24" in match:
+                if f"ipv6 address {ip}" in match:
+                    if f"mac-address {testbed.custom['1mac']}" in match:
+                        if "no shutdown" in match: 
+                            log.info("All required configurations from dual stage commits are present in running-config")
+                            num = num + 1
+                        else:
+                            self.failed("-no shut-")
+                    else:
+                        self.failed("-mac-address-")
+                else:
+                    self.failed("-ipv6-")
+            else:
+                self.failed("-ipv4-")
+        else:
+            self.failed("-interface-")
+            
+        log.info(banner("Reload process will take few minutes..."))
+        uut1.configure("copy running-config startup-config",timeout = 300)
+        uut1.transmit("reload\r",timeout = 300)
+        uut1.receive("This command will reboot the system.",timeout = 300)
+        uut1.transmit("y\r",timeout = 300)
+        uut1.receive("login",timeout = 300)
+        uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+        uut1.receive("Password",timeout = 300)
+        uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+        uut1.receive(f"{uut1.name}#",timeout = 300)
+        log.info("Waiting For 3 Minutes")
+        time.sleep(170)
+        print("Coming up...")
+        for i in range(1, 11):
+            print(".", end='', flush=True)
+            time.sleep(1)
+            
+        m = section.split('\n')
+        m = [n.strip() for n in m]    
+        log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+        x=uut1.execute(f"show running-config interface ethernet {testbed.custom['1interface']}")
+        line = x.split('\n')
+        line = [l.strip() for l in line]
+        y=line
+        for i in y:
+            if i in m:
+                match.append(i)        
+        ip=ipaddress.IPv6Network(f"{testbed.custom['1ipv6']}", strict=False)
+        ipv6=str(ip)
+        address,subnet = ipv6.split('/')
+        ip=f"{address}/64"
+        if f"interface Ethernet{testbed.custom['1interface']}" in match:
+            if f"ip address {testbed.custom['1ipv4']}/24" in match:
+                if f"ipv6 address {ip}" in match:
+                    if f"mac-address {testbed.custom['1mac']}" in match:
+                        if "no shutdown" in match: 
+                            log.info("All required configurations from dual stage commits are present in running-config")
+                            yum = yum + 1
+                        else:
+                            self.failed("-no shut-")
+                    else:
+                        self.failed("-mac-address-")
+                else:
+                    self.failed("-ipv6-")
+            else:
+                self.failed("-ipv4-")
+        else:
+            self.failed("-interface-")
+            
+        if num == 1 and yum == 1:
+            self.passed("Before and after reload configurations are present")
+        elif num == 1 and yum == 0:
+            self.failed("After reload configurations not present")
+        elif num == 0 and yum == 1:
+            self.failed("Before reload configurations not present")
+    @aetest.test
+    def L3_subinterface(self,testbed,testscript):
+        num = 0
+        yum = 0
+        mount = 0
+        count = 0
+        match = []
+        try:
+            uut1.configure(f"no interface ethernet {testbed.custom['2interface']}")
+            sub = testbed.custom['2interface'].split('.')
+            interface = sub[0]
+            uut1.configure(f"interface ethernet {interface}\nno switchport\nno shutdown")
+            mount = mount + 1
+        except:
+            log.info(f"interface {testbed.custom['2interface']} is not present, will create now.")
+            mount = mount + 0
+        if mount == 1:    
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                output=uut1.configure(f"configure dual-stage\ninterface ethernet {testbed.custom['2interface']}\nno shutdown\nip address {testbed.custom['2ipv4']}/24\nipv6 address {testbed.custom['2ipv6']}/64\nmac-address {testbed.custom['2mac']}\nno shutdown\ncommit\nshow running-config interface ethernet {testbed.custom['2interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])        
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface ethernet {testbed.custom['2interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in section:
+                    match.append(i)
+            ip=ipaddress.IPv6Network(f"{testbed.custom['2ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Ethernet{testbed.custom['2interface']}" in match:
+                if f"ip address {testbed.custom['2ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['2mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)
+                
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface ethernet {testbed.custom['2interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in section:
+                    match.append(i)
+            ip=ipaddress.IPv6Network(f"{testbed.custom['2ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Ethernet{testbed.custom['2interface']}" in match:
+                if f"ip address {testbed.custom['2ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['2mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+                
+        elif mount == 0:
+            sub = testbed.custom['2interface'].split('.')
+            interface = sub[0]
+            uut1.configure(f"interface ethernet {interface}\nno switchport\nno shutdown")
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                output=uut1.configure(f"configure dual-stage\ninterface ethernet {testbed.custom['2interface']}\nno shutdown\nip address {testbed.custom['2ipv4']}/24\nipv6 address {testbed.custom['2ipv6']}/64\nmac-address {testbed.custom['2mac']}\nno shutdown\ncommit\nshow running-config interface ethernet {testbed.custom['2interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])        
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface ethernet {testbed.custom['2interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in section:
+                    match.append(i)
+            ip=ipaddress.IPv6Network(f"{testbed.custom['2ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Ethernet{testbed.custom['2interface']}" in match:
+                if f"ip address {testbed.custom['2ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['2mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)
+                
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface ethernet {testbed.custom['2interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in section:
+                    match.append(i)
+            ip=ipaddress.IPv6Network(f"{testbed.custom['2ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Ethernet{testbed.custom['2interface']}" in match:
+                if f"ip address {testbed.custom['2ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['2mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+            
+            if num == 1 and yum == 1:
+                self.passed("Before and after reload configurations are present")
+            elif num == 1 and yum == 0:
+                self.failed("After reload configurations not present")
+            elif num == 0 and yum == 1:
+                self.failed("Before reload configurations not present")    
+    @aetest.test
+    def portchannel(self,testbed,testscript):
+        global port
+        num = 0
+        yum = 0
+        count = 0
+        match = []
+        log.info("Will select any random port from 1 to 30")
+        port = (random.randint(1,30))
+        testscript.parameters['port'] = port
+        out=uut1.configure(f"default interface ethernet 1/{port}",timeout=300)
+        while "Interface config wipeout failed." in out:
+            out=uut1.configure(f"default interface ethernet 1/{port}",timeout=300)
+        uut1.configure(f"no interface port-channel {testbed.custom['3interface']}\ninterface port-channel {testbed.custom['3interface']}\ninterface ethernet 1/{port}\nchannel-group {testbed.custom['3interface']}")
+        log.info(banner("Configuring in Dual-Stage Commit"))
+        try:
+            output=uut1.configure(f"configure dual-stage\ninterface port-channel {testbed.custom['3interface']}\nno switchport\nno shutdown\nip address {testbed.custom['3ipv4']}/24\nipv6 address {testbed.custom['3ipv6']}/64\nmac-address {testbed.custom['3mac']}\nno shutdown\ncommit\nshow running-config interface port-channel {testbed.custom['3interface']}\nexit",timeout = 600)
+            find = re.search(r'version.*?exit', output, re.DOTALL)
+            section = find.group(0)
+            lines = output.split('\n')
+            lines = [line.strip() for line in lines]
+            z=lines
+            pattern=f"Verification Succeeded."
+            for j in z:
+                if pattern == j and 'Commit ID' in output:
+                    count = count + 1
+            if count == 1:
+                log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+            else:
+                self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+        except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])             
+        log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+        x=uut1.execute(f"show running-config interface port-channel {testbed.custom['3interface']}")
+        line = x.split('\n')
+        line = [l.strip() for l in line]
+        y=line
+        for i in y:
+            if i in section:
+                match.append(i)
+        ip=ipaddress.IPv6Network(f"{testbed.custom['3ipv6']}", strict=False)
+        ipv6=str(ip)
+        address,subnet = ipv6.split('/')
+        ip=f"{address}/64"
+        if f"interface port-channel{testbed.custom['3interface']}" in match:
+            if f"ip address {testbed.custom['3ipv4']}/24" in match:
+                if f"ipv6 address {ip}" in match:
+                    if f"mac-address {testbed.custom['3mac']}" in match:
+                        log.info("All required configurations from dual stage commits are present in running-config")
+                        num = num + 1
+                    else:
+                        self.failed("-mac-address-")
+                else:
+                    self.failed("-ipv6-")
+            else:
+                self.failed("-ipv4-")
+        else:
+            self.failed("-interface-")
+            
+        log.info(banner("Reload process will take few minutes..."))
+        uut1.configure("copy running-config startup-config",timeout = 300)
+        uut1.transmit("reload\r",timeout = 300)
+        uut1.receive("This command will reboot the system.",timeout = 300)
+        uut1.transmit("y\r",timeout = 300)
+        uut1.receive("login",timeout = 300)
+        uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+        uut1.receive("Password",timeout = 300)
+        uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+        uut1.receive(f"{uut1.name}#",timeout = 300)
+        log.info("Waiting For 3 Minutes")
+        time.sleep(170)
+        print("Coming up...")
+        for i in range(1, 11):
+            print(".", end='', flush=True)
+            time.sleep(1)
+            
+        log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+        x=uut1.execute(f"show running-config interface port-channel {testbed.custom['3interface']}")
+        line = x.split('\n')
+        line = [l.strip() for l in line]
+        y=line
+        for i in y:
+            if i in section:
+                match.append(i)
+        ip=ipaddress.IPv6Network(f"{testbed.custom['3ipv6']}", strict=False)
+        ipv6=str(ip)
+        address,subnet = ipv6.split('/')
+        ip=f"{address}/64"
+        if f"interface port-channel{testbed.custom['3interface']}" in match:
+            if f"ip address {testbed.custom['3ipv4']}/24" in match:
+                if f"ipv6 address {ip}" in match:
+                    if f"mac-address {testbed.custom['3mac']}" in match:
+                        log.info("All required configurations from dual stage commits are present in running-config")
+                        yum = yum + 1
+                    else:
+                        self.failed("-mac-address-")
+                else:
+                    self.failed("-ipv6-")
+            else:
+                self.failed("-ipv4-")
+        else:
+            self.failed("-interface-")        
+    @aetest.test
+    def portchannel_subinterface(self,testbed,testscript):
+        num = 0
+        yum = 0
+        count = 0
+        mount = 0
+        match = []
+        try:
+            uut1.configure(f"no interface port-channel {testbed.custom['4interface']}")
+            sub = str(testbed.custom['4interface']).split('.')
+            interface = sub[0]
+            uut1.configure(f"interface port-channel {interface}\nno switchport\nno shutdown")
+            mount = mount + 1
+        except:
+            log.info(f"interface {testbed.custom['4interface']} is not present, will create now.")
+            mount = mount + 0
+        if mount == 1:    
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                sub = str(testbed.custom['4interface']).split('.')
+                interface = sub[0]
+                output=uut1.configure(f"configure dual-stage\ninterface port-channel {interface}\nno switchport\ninterface port-channel {testbed.custom['4interface']}\nno shutdown\nip address {testbed.custom['4ipv4']}/24\nipv6 address {testbed.custom['4ipv6']}/64\nmac-address {testbed.custom['4mac']}\nno shutdown\ncommit\nshow running-config interface port-channel {testbed.custom['4interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface port-channel {testbed.custom['4interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['4ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface port-channel{testbed.custom['4interface']}" in match:
+                if f"ip address {testbed.custom['4ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['4mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")    
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)    
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface port-channel {testbed.custom['4interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['4ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface port-channel{testbed.custom['4interface']}" in match:
+                if f"ip address {testbed.custom['4ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['4mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+        elif mount == 0:
+            sub = str(testbed.custom['4interface']).split('.')
+            interface = sub[0]
+            uut1.configure(f"interface port-channel {interface}\nno switchport\nno shutdown")
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                output=uut1.configure(f"configure dual-stage\ninterface port-channel {testbed.custom['4interface']}\nno shutdown\nip address {testbed.custom['4ipv4']}/24\nipv6 address {testbed.custom['4ipv6']}/64\nmac-address {testbed.custom['4mac']}\nno shutdown\ncommit\nshow running-config interface port-channel {testbed.custom['4interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])             
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface port-channel {testbed.custom['4interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['4ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface port-channel{testbed.custom['4interface']}" in match:
+                if f"ip address {testbed.custom['4ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['4mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface port-channel {testbed.custom['4interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['4ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface port-channel{testbed.custom['4interface']}" in match:
+                if f"ip address {testbed.custom['4ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['4mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")            
+    @aetest.test
+    def switch_vlan_interface(self,testbed,testscript):
+        num = 0
+        yum = 0
+        count = 0
+        mount = 0
+        match = []
+        try:
+            uut1.configure(f"feature interface-vlan\nno interface vlan {testbed.custom['5interface']}")
+            mount = mount + 1
+        except:
+            log.info(f"interface {testbed.custom['4interface']} is not present, will create now.")
+            uut1.configure("feature interface-vlan")
+            mount = mount + 0
+        if mount == 1:
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                output=uut1.configure(f"configure dual-stage\nfeature interface-vlan\nvlan {testbed.custom['5interface']}\ninterface vlan {testbed.custom['5interface']}\nno shutdown\nip address {testbed.custom['5ipv4']}/24\nipv6 address {testbed.custom['5ipv6']}/64\nmac-address {testbed.custom['5mac']}\nno shutdown\ncommit\nshow running-config interface vlan {testbed.custom['5interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface vlan {testbed.custom['5interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['5ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Vlan{testbed.custom['5interface']}" in match:
+                if f"ip address {testbed.custom['5ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['5mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")    
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)    
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface vlan {testbed.custom['5interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['5ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Vlan{testbed.custom['5interface']}" in match:
+                if f"ip address {testbed.custom['5ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['5mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")
+        elif mount == 0:
+            log.info(banner("Configuring in Dual-Stage Commit"))
+            try:
+                output=uut1.configure(f"feature interface-vlan\nconfigure dual-stage\nvlan {testbed.custom['5interface']}\ninterface vlan {testbed.custom['5interface']}\nno shutdown\nip address {testbed.custom['5ipv4']}/24\nipv6 address {testbed.custom['5ipv6']}/64\nmac-address {testbed.custom['5mac']}\nno shutdown\ncommit\nshow running-config interface vlan {testbed.custom['5interface']}\nexit",timeout = 600)
+                find = re.search(r'version.*?exit', output, re.DOTALL)
+                section = find.group(0)
+                lines = output.split('\n')
+                lines = [line.strip() for line in lines]
+                z=lines
+                pattern=f"Verification Succeeded."
+                for j in z:
+                    if pattern == j and 'Commit ID' in output:
+                        count = count + 1
+                if count == 1:
+                    log.info("DUAL STAGE COMMIT DONE SUCCESSFULLY.")
+                else:
+                    self.failed("DUAL STAGE COMMIT NOT DONE SUCCESSFULLY.")
+            except:
+                log.warning("Some issue encountered during dual-stage commit.")
+                self.failed(goto=['exit'])
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit before reload"))   
+            x=uut1.execute(f"show running-config interface vlan {testbed.custom['5interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['5ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Vlan{testbed.custom['5interface']}" in match:
+                if f"ip address {testbed.custom['5ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['5mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                num = num + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")       
+                
+            log.info(banner("Reload process will take few minutes..."))
+            uut1.configure("copy running-config startup-config",timeout = 300)
+            uut1.transmit("reload\r",timeout = 300)
+            uut1.receive("This command will reboot the system.",timeout = 300)
+            uut1.transmit("y\r",timeout = 300)
+            uut1.receive("login",timeout = 300)
+            uut1.transmit(f"{testbed.tacacs['username']}\r",timeout = 300)
+            uut1.receive("Password",timeout = 300)
+            uut1.transmit(f"{testbed.passwords['tacacs']}\r",timeout = 300)
+            uut1.receive(f"{uut1.name}#",timeout = 300)
+            log.info("Waiting For 3 Minutes")
+            time.sleep(170)
+            print("Coming up...")
+            for i in range(1, 11):
+                print(".", end='', flush=True)
+                time.sleep(1)      
+                
+            m = section.split('\n')
+            m = [n.strip() for n in m]    
+            log.info(banner("Checking configurations from Dual-Stage Commit after reload"))   
+            x=uut1.execute(f"show running-config interface vlan {testbed.custom['5interface']}")
+            line = x.split('\n')
+            line = [l.strip() for l in line]
+            y=line
+            for i in y:
+                if i in m:
+                    match.append(i)        
+            ip=ipaddress.IPv6Network(f"{testbed.custom['5ipv6']}", strict=False)
+            ipv6=str(ip)
+            address,subnet = ipv6.split('/')
+            ip=f"{address}/64"
+            if f"interface Vlan{testbed.custom['5interface']}" in match:
+                if f"ip address {testbed.custom['5ipv4']}/24" in match:
+                    if f"ipv6 address {ip}" in match:
+                        if f"mac-address {testbed.custom['5mac']}" in match:
+                            if "no shutdown" in match: 
+                                log.info("All required configurations from dual stage commits are present in running-config")
+                                yum = yum + 1
+                            else:
+                                self.failed("-no shut-")
+                        else:
+                            self.failed("-mac-address-")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-interface-")   
+    @aetest.test
+    def consistency_checker_gwmacdb(self,testbed,testscript):
+        out=uut1.execute("show consistency-checker gwmacdb",timeout=600)
+        if "PASSED" in out:
+            self.passed("Consistency-Checker is passed for GateWay MAC DataBase")
+        else:
+            self.failed("Consistency-Checker is failed for GateWay MAC DataBase")
+    @aetest.test
+    def consistency_checker_dme(self,testbed,testscript):
+        out=uut1.execute("show consistency-checker dme running-config enhanced",timeout=600)
+        if "PASSED" in out:
+            self.passed("Consistency-Checker is passed for GateWay MAC DataBase")
+        else:
+            self.failed("Consistency-Checker is failed for GateWay MAC DataBase")
+            
+class xml_validation(aetest.Testcase):
+    @aetest.test
+    def L3_interface(self,testbed,testscript):
+        try:
+            output=uut1.configure(f"show running-config interface ethernet {testbed.custom['1interface']} | xml",timeout=300)
+        except:
+            self.failed("Some issue with XML validation of L3 interface")    
+        if f"Ethernet{testbed.custom['1interface']}" in output:
+            if f"{testbed.custom['1mac']}" in output:
+                if f"{testbed.custom['1ipv4']}/24" in output:
+                    ip=ipaddress.IPv6Network(f"{testbed.custom['1ipv6']}", strict=False)
+                    ipv6=str(ip)
+                    address,subnet = ipv6.split('/')
+                    ip=f"{address}/64"
+                    if f"{ip}" in output:
+                        self.passed("All required configurations present in XML format")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-mac-address-")
+        else:
+            self.failed("-interface-")
+    @aetest.test
+    def L3_subinterface(self,testbed,testscript):
+        try:
+            output=uut1.configure(f"show running-config interface ethernet {testbed.custom['2interface']} | xml",timeout=300)
+        except:
+            self.failed("Some issue with XML validation of L3 subinterface") 
+        if f"Ethernet{testbed.custom['2interface']}" in output:
+            if f"{testbed.custom['2mac']}" in output:
+                if f"{testbed.custom['2ipv4']}/24" in output:
+                    ip=ipaddress.IPv6Network(f"{testbed.custom['2ipv6']}", strict=False)
+                    ipv6=str(ip)
+                    address,subnet = ipv6.split('/')
+                    ip=f"{address}/64"
+                    if f"{ip}" in output:
+                        self.passed("All required configurations present in XML format")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-mac-address-")
+        else:
+            self.failed("-interface-")
+    @aetest.test
+    def portchannel(self,testbed,testscript):
+        try:
+            output=uut1.configure(f"show running-config interface port-channel {testbed.custom['3interface']} | xml",timeout=300)
+        except:
+            self.failed("Some issue with XML validation of Port-Channel subinterface")    
+        if f"port-channel{testbed.custom['3interface']}" in output:
+            if f"{testbed.custom['3mac']}" in output:
+                if f"{testbed.custom['3ipv4']}/24" in output:
+                    ip=ipaddress.IPv6Network(f"{testbed.custom['3ipv6']}", strict=False)
+                    ipv6=str(ip)
+                    address,subnet = ipv6.split('/')
+                    ip=f"{address}/64"
+                    if f"{ip}" in output:
+                        self.passed("All required configurations present in XML format")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-mac-address-")
+        else:
+            self.failed("-interface-")
+    @aetest.test
+    def portchannel_subinterface(self,testbed,testscript):
+        try:
+            output=uut1.configure(f"show running-config interface port-channel {testbed.custom['4interface']} | xml",timeout=300)
+        except:
+            self.failed("Some issue with XML validation of Port-Channel subinterface")    
+        if f"port-channel{testbed.custom['4interface']}" in output:
+            if f"{testbed.custom['4mac']}" in output:
+                if f"{testbed.custom['4ipv4']}/24" in output:
+                    ip=ipaddress.IPv6Network(f"{testbed.custom['4ipv6']}", strict=False)
+                    ipv6=str(ip)
+                    address,subnet = ipv6.split('/')
+                    ip=f"{address}/64"
+                    if f"{ip}" in output:
+                        self.passed("All required configurations present in XML format")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-mac-address-")
+        else:
+            self.failed("-interface-")
+    @aetest.test
+    def switch_vlan_interface(self,testbed,testscript):
+        try:
+            output=uut1.configure(f"show running-config interface vlan {testbed.custom['5interface']} | xml",timeout=300)
+        except:
+            self.failed("Some issue with XML validation of SVI interface")    
+        if f"Vlan{testbed.custom['5interface']}" in output:
+            if f"{testbed.custom['5mac']}" in output:
+                if f"{testbed.custom['5ipv4']}/24" in output:
+                    ip=ipaddress.IPv6Network(f"{testbed.custom['5ipv6']}", strict=False)
+                    ipv6=str(ip)
+                    address,subnet = ipv6.split('/')
+                    ip=f"{address}/64"
+                    if f"{ip}" in output:
+                        self.passed("All required configurations present in XML format")
+                    else:
+                        self.failed("-ipv6-")
+                else:
+                    self.failed("-ipv4-")
+            else:
+                self.failed("-mac-address-")
+        else:
+            self.failed("-interface-")
+    @aetest.test
+    def consistency_checker_gwmacdb(self,testbed,testscript):
+        out=uut1.execute("show consistency-checker gwmacdb",timeout=600)
+        if "PASSED" in out:
+            self.passed("Consistency-Checker is passed for GateWay MAC DataBase")
+        else:
+            self.failed("Consistency-Checker is failed for GateWay MAC DataBase")
+    @aetest.test
+    def consistency_checker_dme(self,testbed,testscript):
+        out=uut1.execute("show consistency-checker dme running-config enhanced",timeout=600)
+        if "PASSED" in out:
+            self.passed("Consistency-Checker is passed for GateWay MAC DataBase")
+        else:
+            self.failed("Consistency-Checker is failed for GateWay MAC DataBase")
+            
+class common_cleanup(aetest.CommonCleanup):
+    @aetest.subsection
+    def clearing_all_configurations(self,testbed,testscript):
+        out=uut1.configure(f"default interface ethernet {testbed.custom['1interface']}",timeout=300)
+        while "Interface config wipeout failed." in out:
+            out=uut1.configure(f"default interface ethernet {testbed.custom['1interface']}",timeout=300)
+        try:
+            uut1.configure(f"no interface ethernet {testbed.custom['2interface']}")
+        except:
+            log.info(f"interface {testbed.custom['2interface']} already removed")   
+        o=uut1.configure(f"default interface ethernet 1/{port}",timeout=300)
+        while "Interface config wipeout failed." in o:
+            o=uut1.configure(f"default interface ethernet 1/{port}",timeout=300)    
+        uut1.configure(f"no interface port-channel {testbed.custom['3interface']}")
+        try:
+            uut1.configure(f"no interface port-channel {testbed.custom['4interface']}")
+            log.info(f"interface {testbed.custom['4interface']} already removed")
+        except:
+            log.info(f"interface port-channel {testbed.custom['4interface']} already removed")
+        uut1.configure(f"no interface vlan {testbed.custom['5interface']}")
+        uut1.configure(f"copy {file} running-config\nterminal dont-ask\ndelete {file}\nno terminal dont-ask",timeout = 600)
+        uut1.disconnect()
+        log.info(banner("Successfully disconnecting from the device.")) 
+
